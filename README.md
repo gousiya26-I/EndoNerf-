@@ -1,5 +1,5 @@
-# EndoNerf-
 
+# Endo-NeRF++: Uncertainty-Aware Sampling and Multi-Resolution Encoding for Dynamic Surgical Scene Reconstruction
 <p align="center">
   <img src="assassets/Research Slides.png" width="800"/>
 </p>
