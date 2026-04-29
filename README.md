@@ -3,7 +3,7 @@
 ### Uncertainty-Aware Sampling and Multi-Resolution Encoding for Dynamic Surgical Scene Reconstruction
 
 <p align="center">
-  <img src="assassets/Diagram final.png" width="800"/>
+  <img src="assassets/Diagram final.jpg" width="800"/>
 </p>
 
 ---
