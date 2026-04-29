@@ -1,3 +1,5 @@
+from Hash_encoding import MultiResHashEncoder
+from feature_blending import FeatureBlender
 from traceback import print_stack
 import torch
 torch.autograd.set_detect_anomaly(True)
@@ -66,66 +68,223 @@ def get_embedder(multires, input_dims, i=0):
 
 
 # Model
+from Hash_encoding import MultiResHashEncoder
+from feature_blending import FeatureBlender
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+torch.autograd.set_detect_anomaly(True)
+
+# =========================
+# Embedder
+# =========================
+class Embedder:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.create_embedding_fn()
+
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs['input_dims']
+        out_dim = 0
+
+        if self.kwargs['include_input']:
+            embed_fns.append(lambda x: x)
+            out_dim += d
+
+        max_freq = self.kwargs['max_freq_log2']
+        N_freqs = self.kwargs['num_freqs']
+
+        freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs)
+
+        for freq in freq_bands:
+            for p_fn in self.kwargs['periodic_fns']:
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                out_dim += d
+
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim
+
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+
+
+def get_embedder(multires, input_dims):
+    embedder_obj = Embedder(
+        include_input=True,
+        input_dims=input_dims,
+        max_freq_log2=multires - 1,
+        num_freqs=multires,
+        log_sampling=True,
+        periodic_fns=[torch.sin, torch.cos],
+    )
+    return lambda x: embedder_obj.embed(x), embedder_obj.out_dim
+
+
+# =========================
+# MAIN MODEL
+# =========================
 class DirectTemporalNeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
-                 use_viewdirs=False, memory=[], embed_fn=None, embedtime_fn=None,
-                 zero_canonical=True, time_window_size=1, time_interval=0.0):
-        super(DirectTemporalNeRF, self).__init__()
-        self.D = D
-        self.W = W
+    def __init__(self,
+                 D=8, W=256,
+                 input_ch=3, input_ch_views=3, input_ch_time=1,
+                 output_ch=4, skips=[4],
+                 use_viewdirs=False,
+                 embed_fn=None,
+                 zero_canonical=True):
+
+        super().__init__()
+
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
         self.input_ch_time = input_ch_time
         self.skips = skips
-        self.use_viewdirs = use_viewdirs
-        self.memory = memory
         self.embed_fn = embed_fn
         self.zero_canonical = zero_canonical
 
-        self._occ = NeRFOriginal(D=D, W=W, input_ch=input_ch, input_ch_views=input_ch_views,
-                                 input_ch_time=input_ch_time, output_ch=output_ch, skips=skips,
-                                 use_viewdirs=use_viewdirs, memory=memory, embed_fn=embed_fn, output_color_ch=3)
+        # HASH
+        self.hash_encoder = MultiResHashEncoder()
+        self.blender = FeatureBlender(self.hash_encoder.num_levels)
+
+        self.hash_dim = self.hash_encoder.features_per_level
+
+        # scaling
+        self.scale = 1.5
+
+        # MLP
+        self._occ = NeRFOriginal(
+            D=D,
+            W=W,
+            input_ch=input_ch + self.hash_dim,
+            input_ch_views=input_ch_views,
+            output_ch=output_ch,
+            skips=skips,
+            use_viewdirs=use_viewdirs
+        )
+
+        # TIME NET
         self._time, self._time_out = self.create_time_net()
 
     def create_time_net(self):
-        layers = [nn.Linear(self.input_ch + self.input_ch_time, self.W)]
-        for i in range(self.D - 1):
-            if i in self.memory:
-                raise NotImplementedError
-            else:
-                layer = nn.Linear
-
-            in_channels = self.W
+        layers = [nn.Linear(self.input_ch + self.input_ch_time, self._occ.pts_linears[0].out_features)]
+        for i in range(len(self._occ.pts_linears) - 1):
+            in_ch = layers[-1].out_features
             if i in self.skips:
-                in_channels += self.input_ch
+                in_ch += self.input_ch
+            layers.append(nn.Linear(in_ch, self._occ.pts_linears[0].out_features))
+        return nn.ModuleList(layers), nn.Linear(self._occ.pts_linears[0].out_features, 3)
 
-            layers += [layer(in_channels, self.W)]
-        return nn.ModuleList(layers), nn.Linear(self.W, 3)
-
-    def query_time(self, new_pts, t, net, net_final):
-        h = torch.cat([new_pts, t], dim=-1)
-        for i, l in enumerate(net):
-            h = net[i](h)
-            h = F.relu(h)
+    def query_time(self, pts_encoded, t):
+        h = torch.cat([pts_encoded, t], dim=-1)
+        for i, l in enumerate(self._time):
+            h = F.relu(l(h))
             if i in self.skips:
-                h = torch.cat([new_pts, h], -1)
+                h = torch.cat([pts_encoded, h], -1)
+        return self._time_out(h)
 
-        return net_final(h)
+   def forward(self, x, ts):
 
-    def forward(self, x, ts):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        input_pts, input_views = torch.split(
+            x, [self.input_ch, self.input_ch_views], dim=-1
+        )
+    
         t = ts[0]
-
-        assert len(torch.unique(t[:, :1])) == 1, "Only accepts all points from same time"
-        cur_time = t[0, 0]
-        if cur_time == 0. and self.zero_canonical:
-            dx = torch.zeros_like(input_pts[:, :3])
+        input_pts_orig = input_pts[:, :3]
+    
+        # ✅ ENCODE BEFORE DEFORMATION
+        pts_encoded = self.embed_fn(input_pts_orig) if self.embed_fn else input_pts
+    
+        # deformation
+        if t[0, 0] == 0. and self.zero_canonical:
+            dx = torch.zeros_like(input_pts_orig)
         else:
-            dx = self.query_time(input_pts, t, self._time, self._time_out)
-            input_pts_orig = input_pts[:, :3]
-            input_pts = self.embed_fn(input_pts_orig + dx)
-        out, _ = self._occ(torch.cat([input_pts, input_views], dim=-1), t)
+            dx = self.query_time(pts_encoded, t)
+    
+        # canonical space
+        canonical_pts = input_pts_orig + dx
+    
+        # scaling
+        canonical_pts = canonical_pts / self.scale
+    
+        # hash encoding
+        multi_feats = self.hash_encoder(canonical_pts)
+    
+        # blending
+        blended_feats = self.blender(multi_feats, t)
+    
+        # positional encoding AFTER deformation
+        pos_feats = self.embed_fn(canonical_pts) if self.embed_fn else canonical_pts
+    
+        # final input
+        input_pts_final = torch.cat([pos_feats, blended_feats], dim=-1)
+    
+        # MLP
+        out, _ = self._occ(torch.cat([input_pts_final, input_views], dim=-1))
+    
         return out, dx
+
+
+# =========================
+# BASIC NeRF MLP
+# =========================
+class NeRFOriginal(nn.Module):
+    def __init__(self,
+                 D=8, W=256,
+                 input_ch=3,
+                 input_ch_views=3,
+                 output_ch=4,
+                 skips=[4],
+                 use_viewdirs=False):
+
+        super().__init__()
+
+        self.input_ch = input_ch
+        self.input_ch_views = input_ch_views
+        self.skips = skips
+        self.use_viewdirs = use_viewdirs
+
+        self.pts_linears = nn.ModuleList(
+            [nn.Linear(input_ch, W)] +
+            [nn.Linear(W + input_ch, W) if i in skips else nn.Linear(W, W)
+             for i in range(D - 1)]
+        )
+
+        if use_viewdirs:
+            self.feature_linear = nn.Linear(W, W)
+            self.alpha_linear = nn.Linear(W, 1)
+            self.views_linears = nn.ModuleList([nn.Linear(W + input_ch_views, W // 2)])
+            self.rgb_linear = nn.Linear(W // 2, 3)
+        else:
+            self.output_linear = nn.Linear(W, output_ch)
+
+    def forward(self, x):
+        input_pts, input_views = torch.split(
+            x, [self.input_ch, self.input_ch_views], dim=-1
+        )
+
+        h = input_pts
+        for i, l in enumerate(self.pts_linears):
+            h = F.relu(l(h))
+            if i in self.skips:
+                h = torch.cat([input_pts, h], -1)
+
+        if self.use_viewdirs:
+            alpha = self.alpha_linear(h)
+            feature = self.feature_linear(h)
+            h = torch.cat([feature, input_views], -1)
+
+            for l in self.views_linears:
+                h = F.relu(l(h))
+
+            rgb = self.rgb_linear(h)
+            outputs = torch.cat([rgb, alpha], -1)
+        else:
+            outputs = self.output_linear(h)
+
+        return outputs, None
 
 class TNeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_ch_time=1, output_ch=4, skips=[4],
